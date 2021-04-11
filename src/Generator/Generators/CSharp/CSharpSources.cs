@@ -648,6 +648,15 @@ namespace CppSharp.Generators.CSharp
                     if (ctor.IsDefaultConstructor && !@class.HasNonTrivialDefaultConstructor)
                         continue;
 
+                    // If we have a trivial copy constructor and this is a RefType, the copy
+                    // constructor is implemented by copying unmanaged memory from the source to the
+                    // unmanaged memory of the target. If this is a ValueType, the copy constructor
+                    // delegates to the native copy constructor. In the trivial cctor RefType case,
+                    // the native copy constructor is never referenced. Avoid generating it. In the
+                    // ValueType case, we must generate it.
+                    if (ctor.IsCopyConstructor && !@class.HasNonTrivialCopyConstructor && !@class.IsValueType)
+                        continue;
+
                     tryAddOverload(ctor);
                 }
             }
