@@ -455,6 +455,12 @@ namespace CppSharp.Generators.CSharp
                     var dict = $@"global::System.Collections.Concurrent.ConcurrentDictionary<IntPtr, {
                         printedClass}>";
                     WriteLine("internal static readonly {0} NativeToManagedMap = new {0}();", dict);
+
+                    // Add booleans to track who owns unmanaged memory for string fields
+                    foreach (var field in @class.Layout.Fields.Where(f => f.QualifiedType.Type.IsConstCharString()))
+                    {
+                        WriteLine($"private bool __{field.Name}_OwnsNativeMemory = false;");
+                    }
                 }
                 PopBlock(NewLineKind.BeforeNextBlock);
             }
@@ -846,7 +852,7 @@ namespace CppSharp.Generators.CSharp
                 if (sequentialLayout && i > 0)
                 {
                     var padding = field.Offset - field.CalculateOffset(fields[i - 1], Context.TargetInfo);
-                        
+
                     if (padding > 1)
                         WriteLine($"internal fixed byte {field.Name}Padding[{padding}];");
                     else if (padding > 0)
@@ -880,7 +886,7 @@ namespace CppSharp.Generators.CSharp
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        #endregion
+#endregion
 
         private void GeneratePropertySetter<T>(T decl,
             Class @class, bool isAbstract = false, Property property = null)
@@ -1420,13 +1426,17 @@ namespace CppSharp.Generators.CSharp
                 if (templateSubstitution != null && returnType.Type.IsDependent)
                     Write($"({templateSubstitution.ReplacedParameter.Parameter.Name}) (object) ");
                 if ((final.IsPrimitiveType() && !final.IsPrimitiveType(PrimitiveType.Void) &&
-                    (!final.IsPrimitiveType(PrimitiveType.Char) &&
-                     !final.IsPrimitiveType(PrimitiveType.WideChar) ||
+                    ((!final.IsPrimitiveType(PrimitiveType.Char) &&
+                      !final.IsPrimitiveType(PrimitiveType.WideChar) &&
+                      !final.IsPrimitiveType(PrimitiveType.Char16) &&
+                      !final.IsPrimitiveType(PrimitiveType.Char32)) ||
                      (!Context.Options.MarshalCharAsManagedChar &&
                       !((PointerType) field.Type).QualifiedPointee.Qualifiers.IsConst)) &&
                     templateSubstitution == null) ||
                     (!((PointerType) field.Type).QualifiedPointee.Qualifiers.IsConst &&
-                     final.IsPrimitiveType(PrimitiveType.WideChar)))
+                      (final.IsPrimitiveType(PrimitiveType.WideChar) || 
+                       final.IsPrimitiveType(PrimitiveType.Char16) || 
+                       final.IsPrimitiveType(PrimitiveType.Char32))))
                     Write($"({field.Type.GetPointee().Desugar()}*) ");
             }
             WriteLine($"{@return};");
@@ -1635,7 +1645,7 @@ namespace CppSharp.Generators.CSharp
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        #region Virtual Tables
+#region Virtual Tables
 
         public List<VTableComponent> GetUniqueVTableMethodEntries(Class @class)
         {
@@ -2042,9 +2052,9 @@ namespace CppSharp.Generators.CSharp
             return @class.IsGenerated && @class.IsDynamic && GetUniqueVTableMethodEntries(@class).Count > 0;
         }
 
-        #endregion
+#endregion
 
-        #region Events
+#region Events
 
         public override bool VisitEvent(Event @event)
         {
@@ -2152,9 +2162,9 @@ namespace CppSharp.Generators.CSharp
             UnindentAndWriteCloseBrace();
         }
 
-        #endregion
+#endregion
 
-        #region Constructors
+#region Constructors
 
         public void GenerateClassConstructors(Class @class)
         {
@@ -2273,6 +2283,21 @@ namespace CppSharp.Generators.CSharp
                     else
                         Unindent();
                 }
+            }
+
+            // If we have any fields holding references to unmanaged memory allocated here, free the
+            // referenced memory. Don't rely on testing if the field's IntPtr is IntPtr.Zero since 
+            // unmanaged memory isn't always initialized and/or a reference may be owned by the
+            // native side.
+            //
+            // TODO: We should delegate to the dispose methods of references we hold to other
+            // generated type instances since those instances could also hold references to
+            // unmanaged memory.
+            foreach (var field in @class.Layout.Fields.Where(f => f.QualifiedType.Type.IsConstCharString()))
+            {
+                var ptr = $"(({Helpers.InternalStruct}*){Helpers.InstanceIdentifier})->{field.Name}";
+                WriteLine($"if (__{field.Name}_OwnsNativeMemory)");
+                WriteLineIndent($"Marshal.FreeHGlobal({ptr});");
             }
 
             WriteLine("if ({0})", Helpers.OwnsNativeInstanceIdentifier);
@@ -2491,9 +2516,9 @@ internal static{(@new ? " new" : string.Empty)} {printedClass} __GetInstance({Ty
                 WriteLineIndent(": this()");
         }
 
-        #endregion
+#endregion
 
-        #region Methods / Functions
+#region Methods / Functions
 
         public void GenerateFunction(Function function, string parentName)
         {
@@ -2907,10 +2932,28 @@ internal static{(@new ? " new" : string.Empty)} {printedClass} __GetInstance({Ty
                     var classInternal = TypePrinter.PrintNative(@class);
                     WriteLine($@"*(({classInternal}*) {Helpers.InstanceIdentifier}) = *(({
                         classInternal}*) {method.Parameters[0].Name}.{Helpers.InstanceIdentifier});");
+
+                    // Copy any string references owned by the source to the new instance so we
+                    // don't have to ref count them.
+                    foreach (var field in @class.Fields.Where(f => f.QualifiedType.Type.IsConstCharString()))
+                    {
+                        var prop = @class.Properties.Where(p => p.Field == field).FirstOrDefault();
+                        // If there is no property or no setter then this instance can never own the native
+                        // memory. Worry about the case where there's only a setter (write-only) when we 
+                        // understand the use case and how it can occur.
+                        if (prop != null && prop.HasGetter && prop.HasSetter)
+                        {
+                            WriteLine($"if ({method.Parameters[0].Name}.__{field.OriginalName}_OwnsNativeMemory)");
+                            WriteLineIndent($@"this.{prop.Name} = {method.Parameters[0].Name}.{prop.Name};");
+                        }
+                    }
                 }
             }
             else
             {
+                if (method.IsDefaultConstructor && Context.Options.ZeroAllocatedMemory(@class))
+                    WriteLine($"global::System.Runtime.CompilerServices.Unsafe.InitBlock((void*){Helpers.InstanceIdentifier}, 0, (uint)sizeof({@internal}));");
+
                 if (!method.IsDefaultConstructor || @class.HasNonTrivialDefaultConstructor)
                     GenerateInternalFunctionCall(method);
             }
@@ -3239,7 +3282,7 @@ internal static{(@new ? " new" : string.Empty)} {printedClass} __GetInstance({Ty
             return TypePrinter.VisitParameters(@params, true).Type;
         }
 
-        #endregion
+#endregion
 
         public override bool VisitTypedefNameDecl(TypedefNameDecl typedef)
         {
